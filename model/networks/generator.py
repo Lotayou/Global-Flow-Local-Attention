@@ -257,11 +257,134 @@ class PoseFlowNetGenerator(BaseNetwork):
     def forward(self, source, source_B, target_B):
         flow_fields, masks = self.flow_net(source, source_B, target_B)
         return flow_fields, masks
+        
+######################################################################################################
+# Pose-Guided Person Image Animation
+######################################################################################################        
+class DanceGenerator(BaseNetwork):
+    def __init__(self,  image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
+                norm='batch', activation='ReLU', attn_layer=[1,2], extractor_kz={'1':5,'2':5}, use_spect=True, use_coord=False):  
+        super(DanceGenerator, self).__init__()
+        self.source_previous = PoseSourceNet(image_nc, ngf, img_f, layers, 
+                                                    norm, activation, use_spect, use_coord)
+        self.source_reference = PoseSourceNet(image_nc, ngf, img_f, layers, 
+                                                    norm, activation, use_spect, use_coord)        
+        self.target = FaceTargetNet(image_nc, structure_nc, output_nc, ngf, img_f, layers, num_blocks, 
+                                    norm, activation, attn_layer, extractor_kz, use_spect, use_coord)
+
+        flow_norm, flow_activation = 'instance', 'LeakyReLU'
+        self.flow_net_previous = PoseFlowNet(image_nc, structure_nc, ngf=32, img_f=256, encoder_layer=5, 
+                                            attn_layer=attn_layer, norm=flow_norm, activation=flow_activation,
+                                            use_spect=use_spect, use_coord=use_coord)  
+
+        self.flow_net_reference= PoseFlowNet(image_nc, structure_nc, ngf=32, img_f=256, encoder_layer=5, 
+                                            attn_layer=attn_layer, norm=flow_norm, activation=flow_activation,
+                                            use_spect=use_spect, use_coord=use_coord)                                                     
+
+    def forward(self, BP_frame_step, P_reference, BP_reference, P_previous, BP_previous):
+        n_frames_load = BP_frame_step.size(1)
+        out_image_gen,out_flow_fields,out_masks,P_previous_recoder=[],[],[],[]
+
+        for i in range(n_frames_load):
+            BP = BP_frame_step[:,i,...]
+            P_previous  = P_reference  if P_previous  is None else  P_previous
+            BP_previous = BP_reference if BP_previous is None else  BP_previous
+            P_previous_recoder.append(P_previous)
+
+            previous_feature_list = self.source_previous(P_previous)
+            reference_feature_list = self.source_reference(P_reference)
+
+            # Sources_image = torch.cat((P_previous, P_reference ), 0)
+            # Sources_bone  = torch.cat((BP_previous,BP_reference), 0)
+            # Targets_bone  = torch.cat((BP, BP), 0)
+
+            flow_fields_p, masks_p = self.flow_net_previous( P_previous,  BP_previous,  BP)
+            flow_fields_r, masks_r = self.flow_net_reference(P_reference, BP_reference, BP)
+            flow,mask=[],[]
+            for i in range(len(flow_fields_p)):
+                flow.append(flow_fields_p[i])
+                flow.append(flow_fields_r[i])
+                mask.append(masks_p[i]) 
+                mask.append(masks_r[i]) 
+            image_gen = self.target(BP, previous_feature_list, reference_feature_list, flow, mask)
+            P_previous = image_gen
+            BP_previous = BP
+
+            out_image_gen.append(image_gen)
+            out_flow_fields.append(flow)
+            out_masks.append(mask)
+        return out_image_gen, out_flow_fields, out_masks, P_previous_recoder  
+
+
+
+class KPInput2DGenerator(BaseNetwork):
+    def __init__(self, structure_nc=18, channels=256, layers=4):  
+        super(KPInput2DGenerator, self).__init__()
+        self.kp_input = KPInputNet2D(keypoint_nc=structure_nc, channels=channels, layers=layers)
+
+       
+    def forward(self, input_2d):
+        keypoints = self.kp_input(input_2d)
+        return keypoints
+
+
+class KPInputNet2D(BaseNetwork):
+    def __init__(self, keypoint_nc=25, channels=256, layers=3, dropout=0.15, image_size=(256,256)):
+        super(KPInputNet2D, self).__init__()
+        kernel_size=3
+        self.keypoint_nc = keypoint_nc
+        self.image_size = image_size
+        self.layers = layers
+        self.expand_conv = nn.Conv1d(keypoint_nc*2, channels, kernel_size, bias=False)
+        self.expand_ln = LayerNorm1d(channels)
+
+        self.shrink = nn.Conv1d(channels, keypoint_nc*2, 1)
+        self.drop = nn.Dropout(dropout)
+        self.relu = nn.ReLU(inplace=True)  
+        self.lrelu = nn.LeakyReLU(0.1)  
+
+        layers_conv = []
+        layers_ln = []
+        self.pad=[(kernel_size - 1) // 2]
+        next_dilation = kernel_size
+        for i in range(1, self.layers):
+            self.pad.append((kernel_size - 1)*next_dilation // 2)
+            layers_conv.append(nn.Conv1d(channels,channels,kernel_size,
+                                         dilation=next_dilation,bias=False))
+            layers_ln.append(ADALN1d(channels, channels))
+            layers_conv.append(nn.Conv1d(channels, channels, 1,  dilation=1, bias=False))
+            layers_ln.append(ADALN1d(channels, channels))
+
+            next_dilation *= kernel_size
+            
+        self.layers_conv = nn.ModuleList(layers_conv)
+        self.layers_ln = nn.ModuleList(layers_ln)
+
+        self.feature_conv_1 = nn.Conv1d(keypoint_nc*2, channels, kernel_size, stride=2 ,bias=False)
+        self.feature_conv_2 = nn.Conv1d(channels, channels, kernel_size, stride=2 ,bias=False)
+        self.feature_conv_3 = nn.Conv1d(channels, channels, kernel_size, stride=2 ,bias=False)
+
+    def forward(self, kp):
+        feature = self.lrelu(self.feature_conv_1(kp))
+        feature = self.lrelu(self.feature_conv_2(feature))
+        feature = self.lrelu(self.feature_conv_3(feature))
+        feature = torch.mean(feature, 2)
+
+
+        x = self.drop(self.lrelu(self.expand_ln(self.expand_conv(kp))))
+        for i in range(self.layers - 1):
+            pad = self.pad[i+1]
+            res = x[:, :, pad : x.shape[2] - pad]
+            x = self.drop(self.lrelu(self.layers_ln[2*i](self.layers_conv[2*i](x), feature)))
+            x = res + self.drop(self.lrelu(self.layers_ln[2*i+1](self.layers_conv[2*i+1](x), feature)))
+        
+        x = self.shrink(x)
+        return x
+
 
 ######################################################################################################
 # Face Image Generation 
 ######################################################################################################        
-
 class FaceGenerator(BaseNetwork):
     def __init__(self,  image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
                 norm='batch', activation='ReLU', attn_layer=[1,2], extractor_kz={'1':5,'2':5}, use_spect=True, use_coord=False):  
@@ -464,7 +587,6 @@ class FaceFlowNet(nn.Module):
 ######################################################################################################
 # Shape Net Image Generation (Multi-view synthesis)
 ######################################################################################################        
-        
 class ShapeNetGenerator(BaseNetwork):
     def __init__(self,  image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
                 norm='batch', activation='ReLU',   attn_layer=[1,2], extractor_kz={'1':5,'2':5}, use_spect=True, use_coord=False):
@@ -651,295 +773,3 @@ class ShapeNetFlowNetGenerator(BaseNetwork):
         return flow_fields, masks 
 
 
-
-###################################################################################################################
-# ablation models
-###################################################################################################################
-
-class BaseLineGenerator(BaseNetwork):
-    """
-    baseline convolution network 
-    """
-    def __init__(self, image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', use_spect=True, use_coord=False):
-        super(BaseLineGenerator, self).__init__()
-        self.network = BaseLineNet(image_nc, structure_nc, output_nc, ngf, img_f, layers, num_blocks, 
-                                norm, activation, attn_layer=[], use_spect=use_spect, use_coord=use_coord) 
-
-    def forward(self, source, source_B, target_B):
-        results = self.network(source_B, target_B, source)
-        return results    
-
-class GlobalAttnGenerator(BaseNetwork):
-    """Global Attention in the paper"""
-    def __init__(self, image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', attn_layer=[2,3], use_spect=True, use_coord=False):
-        super(GlobalAttnGenerator, self).__init__()
-        self.target = GlobalAttnNet(image_nc, structure_nc, output_nc, ngf, img_f, layers, num_blocks, 
-                                norm, activation, attn_layer=attn_layer, use_spect=use_spect, use_coord=use_coord) 
-
-        self.source = PoseSourceNet(image_nc+structure_nc, ngf, img_f, layers, 
-                                                    norm, activation, use_spect, use_coord) 
-    def forward(self, source, source_B, target_B):
-        inputs = torch.cat([source,source_B], 1)
-        # inputs = source
-        source_list = self.source(inputs)
-        results = self.target(target_B, source_list)
-        return results    
-
-
-    def hook_attn_map(self, source, source_B, target_B):
-        inputs = torch.cat([source,source_B], 1)
-        # inputs = source
-        source_list = self.source(inputs)
-        attn_map, results = self.target.forward_hook_function(target_B, source_list)
-        return attn_map, results  
-
-
-class BilinearSamplingGenerator(BaseNetwork):
-    def __init__(self,  image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', attn_layer=[1,2], use_spect=True, use_coord=False):  
-        super(BilinearSamplingGenerator, self).__init__()
-        self.source = PoseSourceNet(image_nc, ngf, img_f, layers, 
-                                                    norm, activation, use_spect, use_coord)
-        self.target = BilinearTargetNet(image_nc, structure_nc, output_nc, ngf, img_f, layers, num_blocks, 
-                                                norm, activation, attn_layer, use_spect, use_coord)
-        self.flow_net = PoseFlowNet(image_nc, structure_nc, ngf=32, img_f=256, encoder_layer=5, 
-                                    attn_layer=attn_layer, norm=norm, activation=activation,
-                                    use_spect=use_spect, use_coord=use_coord)       
-
-    def forward(self, source, source_B, target_B):
-        feature_list = self.source(source)
-        flow_fields, masks = self.flow_net(source, source_B, target_B)
-        image_gen = self.target(target_B, feature_list, flow_fields, masks)
-
-        return image_gen, flow_fields, masks              
-
-
-class BaseLineNet(BaseNetwork):
-    def __init__(self, image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', attn_layer=[1,2], use_spect=True, use_coord=False):  
-        super(BaseLineNet, self).__init__()
-
-        self.layers = layers
-        self.attn_layer = attn_layer
-
-        norm_layer = get_norm_layer(norm_type=norm)
-        nonlinearity = get_nonlinearity_layer(activation_type=activation)
-
-        self.block0 = EncoderBlock(structure_nc*2+image_nc, ngf, norm_layer,
-                                   nonlinearity, use_spect, use_coord)
-        mult = 1
-        for i in range(layers-1):
-            mult_prev = mult
-            mult = min(2 ** (i + 1), img_f//ngf)
-            block = EncoderBlock(ngf*mult_prev, ngf*mult, norm_layer,
-                                 nonlinearity, use_spect, use_coord)
-            setattr(self, 'encoder' + str(i), block)         
-        # decoder part
-        mult = min(2 ** (layers-1), img_f//ngf)
-        for i in range(layers):
-            mult_prev = mult
-            mult = min(2 ** (layers-i-2), img_f//ngf) if i != layers-1 else 1
-            if num_blocks == 1:
-                up = nn.Sequential(ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                         nonlinearity, use_spect, use_coord))
-            else:
-                up = nn.Sequential(ResBlocks(num_blocks-1, ngf*mult_prev, None, None, norm_layer, 
-                                             nonlinearity, False, use_spect, use_coord),
-                                   ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                             nonlinearity, use_spect, use_coord))
-            setattr(self, 'decoder' + str(i), up)
-
-            if layers-i in attn_layer:
-                attn = SelfAttentionBlock(ngf*mult_prev)
-                setattr(self, 'attn' + str(i), attn)
-
-        self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spect, use_coord)
-
-
-    def forward(self, source_B, target_B, source_images):
-        inputs = torch.cat((source_B, target_B, source_images), 1)
-        out = self.block0(inputs)
-        for i in range(self.layers-1):
-            model = getattr(self, 'encoder' + str(i))
-            out = model(out) 
-
-        for i in range(self.layers):
-            if self.layers-i in self.attn_layer:
-                model = getattr(self, 'attn' + str(i))
-                out_attn, attn_map = model(out)        
-                out = out + out_attn
-            model = getattr(self, 'decoder' + str(i))
-            out = model(out)
-
-        out_image = self.outconv(out)
-        return out_image
-
-    def forward_hook_function(self, source_B, target_B, source_images):
-        hook_attn_map=[]
-        inputs = torch.cat((source_B, target_B, source_images), 1)
-        out = self.block0(inputs)
-        for i in range(self.layers-1):
-            model = getattr(self, 'encoder' + str(i))
-            out = model(out) 
-
-        for i in range(self.layers):
-            if self.layers-i in self.attn_layer:
-                model = getattr(self, 'attn' + str(i))
-                out_attn, attn_map = model(out)        
-                out = out + out_attn
-                hook_attn_map.append(attn_map)
-            model = getattr(self, 'decoder' + str(i))
-            out = model(out)
-        out_image = self.outconv(out)
-        return hook_attn_map, out_image    
-
-
-class GlobalAttnNet(BaseNetwork):
-
-    def __init__(self, image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', attn_layer=[1,2], use_spect=True, use_coord=False):  
-        super(GlobalAttnNet, self).__init__()
-
-        self.layers = layers
-        self.attn_layer = attn_layer
-
-        norm_layer = get_norm_layer(norm_type=norm)
-        nonlinearity = get_nonlinearity_layer(activation_type=activation)
-
-        self.block0 = EncoderBlock(structure_nc, ngf, norm_layer,
-                                   nonlinearity, use_spect, use_coord)
-        mult = 1
-        for i in range(layers-1):
-            mult_prev = mult
-            mult = min(2 ** (i + 1), img_f//ngf)
-            block = EncoderBlock(ngf*mult_prev, ngf*mult, norm_layer,
-                                 nonlinearity, use_spect, use_coord)
-            setattr(self, 'encoder' + str(i), block)         
-
-
-        # decoder part
-        mult = min(2 ** (layers-1), img_f//ngf)
-        for i in range(layers):
-            mult_prev = mult
-            mult = min(2 ** (layers-i-2), img_f//ngf) if i != layers-1 else 1
-            if num_blocks == 1:
-                up = nn.Sequential(ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                         nonlinearity, use_spect, use_coord))
-            else:
-                up = nn.Sequential(ResBlocks(num_blocks-1, ngf*mult_prev, None, None, norm_layer, 
-                                             nonlinearity, False, use_spect, use_coord),
-                                   ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                             nonlinearity, use_spect, use_coord))
-            setattr(self, 'decoder' + str(i), up)
-
-            if layers-i in attn_layer:
-                attn = GlobalAttentionBlock(ngf*mult_prev)
-                setattr(self, 'attn' + str(i), attn)
-
-        self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spect, use_coord)
-
-
-    def forward(self, target_B, source_list):
-        inputs = target_B
-        out = self.block0(inputs)
-        for i in range(self.layers-1):
-            model = getattr(self, 'encoder' + str(i))
-            out = model(out) 
-
-        for i in range(self.layers):
-            if self.layers-i in self.attn_layer:
-                model = getattr(self, 'attn' + str(i))
-                out_attn, attn_map = model(source_list[i], out)        
-                out = out + out_attn
-            model = getattr(self, 'decoder' + str(i))
-            out = model(out)
-
-        out_image = self.outconv(out)
-        return out_image
-
-    def forward_hook_function(self, target_B, source_list):
-        hook_attn_map=[]
-        inputs = target_B
-        out = self.block0(inputs)
-        for i in range(self.layers-1):
-            model = getattr(self, 'encoder' + str(i))
-            out = model(out) 
-
-        for i in range(self.layers):
-            if self.layers-i in self.attn_layer:
-                model = getattr(self, 'attn' + str(i))
-                out_attn, attn_map = model(source_list[i], out)        
-                out = out + out_attn
-                hook_attn_map.append(attn_map)
-            model = getattr(self, 'decoder' + str(i))
-            out = model(out)
-
-        out_image = self.outconv(out)
-        return hook_attn_map, out_image    
-
-
-class BilinearTargetNet(BaseNetwork):
-    def __init__(self, image_nc=3, structure_nc=18, output_nc=3, ngf=64, img_f=1024, layers=6, num_blocks=2, 
-                norm='batch', activation='ReLU', attn_layer=[1,2], use_spect=True, use_coord=False):  
-        super(BilinearTargetNet, self).__init__()
-
-        self.layers = layers
-        self.attn_layer = attn_layer
-
-        norm_layer = get_norm_layer(norm_type=norm)
-        nonlinearity = get_nonlinearity_layer(activation_type=activation)
-
-        self.block0 = EncoderBlock(structure_nc, ngf, norm_layer,
-                                 nonlinearity, use_spect, use_coord)
-        mult = 1
-        for i in range(layers-1):
-            mult_prev = mult
-            mult = min(2 ** (i + 1), img_f//ngf)
-            block = EncoderBlock(ngf*mult_prev, ngf*mult, norm_layer,
-                                 nonlinearity, use_spect, use_coord)
-            setattr(self, 'encoder' + str(i), block)         
-
-
-        # decoder part
-        mult = min(2 ** (layers-1), img_f//ngf)
-        for i in range(layers):
-            mult_prev = mult
-            mult = min(2 ** (layers-i-2), img_f//ngf) if i != layers-1 else 1
-            if num_blocks == 1:
-                up = nn.Sequential(ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                         nonlinearity, use_spect, use_coord))
-            else:
-                up = nn.Sequential(ResBlocks(num_blocks-1, ngf*mult_prev, None, None, norm_layer, 
-                                             nonlinearity, False, use_spect, use_coord),
-                                   ResBlockDecoder(ngf*mult_prev, ngf*mult, None, norm_layer, 
-                                             nonlinearity, use_spect, use_coord))
-            setattr(self, 'decoder' + str(i), up)
-
-            if layers-i in attn_layer:
-                attn = BilinearSamplingBlock()
-                setattr(self, 'attn' + str(i), attn)
-
-        self.outconv = Output(ngf, output_nc, 3, None, nonlinearity, use_spect, use_coord)
-
-
-    def forward(self, target_B, source_feature, flow_fields, masks):
-        out = self.block0(target_B)
-        for i in range(self.layers-1):
-            model = getattr(self, 'encoder' + str(i))
-            out = model(out) 
-
-        counter=0
-        for i in range(self.layers):
-            if self.layers-i in self.attn_layer:
-                model = getattr(self, 'attn' + str(i))
-                out_attn = model(source_feature[i], flow_fields[counter])        
-                out = out*(1-masks[counter]) + out_attn*masks[counter]
-                counter += 1
-
-            model = getattr(self, 'decoder' + str(i))
-            out = model(out)
-
-        out_image = self.outconv(out)
-        return out_image                                            
